@@ -4,14 +4,11 @@ import (
 	"fmt"
 	"net"
 	"strings"
-	"syscall"
 )
 
 var _ = fmt.Println
 
 func isErrConnReset(err error) bool {
-	// fmt.Printf("calling isErrConnReset for err type: %v Error() %s\n",
-	// reflect.TypeOf(err), err.Error())
 	if ne, ok := err.(*net.OpError); ok {
 		// fmt.Println("isErrConnReset net.OpError.Err type:", reflect.TypeOf(ne))
 		errMsg := ne.Err.Error()
