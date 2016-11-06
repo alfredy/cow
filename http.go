@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+    "io"
 )
 
 const CRLF = "\r\n"
@@ -327,9 +328,11 @@ func ParseRequestURIBytes(rawurl []byte) (*URL, error) {
 // "Proxy-Support: Session-Based-Authentication" needed for tunneling NTLM,
 // https://tools.ietf.org/html/rfc4559#section-6
 const (
+    headerCacheControl       = "cache-control"
 	headerConnection         = "connection"
 	headerContentLength      = "content-length"
 	headerExpect             = "expect"
+    headerExpires            = "expires"
 	headerHost               = "host"
 	headerKeepAlive          = "keep-alive"
 	headerProxyAuthenticate  = "proxy-authenticate"
@@ -362,6 +365,12 @@ var headerParser = map[string]HeaderParserFunc{
 	headerWWWAuthenticate:    (*Header).parseWWWAuthenticate,
 	headerTransferEncoding:   (*Header).parseTransferEncoding,
 	headerTrailer:            (*Header).parseTrailer,
+}
+
+var headerParser2 = map[string]HeaderParserFunc{
+    headerCacheControl:       (*Header).parseCacheControl,
+	headerConnection:         (*Header).parseConnection2,
+    headerExpires:            (*Header).parseExpires,
 }
 
 var hopByHopHeader = map[string]bool{
@@ -491,6 +500,31 @@ func (h *Header) parseExpect(s []byte) error {
 	return nil
 }
 
+// for anti-http-hijack of ISP
+func (h *Header) parseConnection2(s []byte) (err error) {
+	ASCIIToLowerInplace(s)
+    if bytes.Contains(s, []byte("close")) {
+        return RetryError{err}
+    }
+    return nil
+}
+
+func (h *Header) parseCacheControl(s []byte) (err error) {
+	ASCIIToLowerInplace(s)
+    if bytes.Contains(s, []byte("no-store,no-cache,must-revalidate,post-check=0,pre-check=0")) {
+        return RetryError{err}
+    }
+    return nil
+}
+
+func (h *Header) parseExpires(s []byte) (err error) {
+	ASCIIToLowerInplace(s)
+    if bytes.Equal(s, []byte("0")) {
+        return RetryError{err}
+    }
+    return nil
+}
+
 func splitHeader(s []byte) (name, val []byte, err error) {
 	i := bytes.IndexByte(s, ':')
 	if i < 0 {
@@ -578,24 +612,39 @@ func skipSpace(r *bufio.Reader) int {
 // Only add headers that are of interest for a proxy into request/response's header map.
 func (h *Header) parseHeader(reader *bufio.Reader, raw *bytes.Buffer, url *URL) (err error) {
 	h.ContLen = -1
+    hijackHeader := 0
+    hasServer := 0
 	for {
 		var line, name, val []byte
 		if line, err = readContinuedLineSlice(reader); err != nil || len(line) == 0 {
-			return
+			break
 		}
 		if name, val, err = splitHeader(line); err != nil {
 			errl.Printf("split header %v\nline: %s\nraw header:\n%s\n", err, line, raw.Bytes())
-			return
+			break
 		}
+        // hijacked header no "server"
+        if bytes.Equal(name, []byte("server")) {
+            hasServer = 1
+        }
 		// Wait Go to solve/provide the string<->[]byte optimization
 		kn := string(name)
+        // hijacked header check
+        if parseFunc, ok := headerParser2[kn]; ok {
+            if len(val) == 0 {
+                continue
+            }
+            if err = parseFunc(h, val); err != nil {
+                hijackHeader++
+            }
+        }
 		if parseFunc, ok := headerParser[kn]; ok {
 			if len(val) == 0 {
 				continue
 			}
 			if err = parseFunc(h, val); err != nil {
 				errl.Printf("parse header %v\nline: %s\nraw header:\n%s\n", err, line, raw.Bytes())
-				return
+				break
 			}
 		}
 		if hopByHopHeader[kn] {
@@ -604,6 +653,13 @@ func (h *Header) parseHeader(reader *bufio.Reader, raw *bytes.Buffer, url *URL) 
 		raw.Write(line)
 		// debug.Printf("len %d %s", len(s), s)
 	}
+    // all hijacked conditions are matched, and no "server" header
+    if hijackHeader == 3 && hasServer == 0 {
+        info.Printf("ISP hijack your request, retry...\n")
+        err = io.EOF
+        return
+    }
+    return
 }
 
 // Parse the request line and header, does not touch body
