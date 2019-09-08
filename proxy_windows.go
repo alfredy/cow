@@ -10,22 +10,33 @@ var _ = fmt.Println
 
 func isErrConnReset(err error) bool {
 	if ne, ok := err.(*net.OpError); ok {
-		return strings.Contains(ne.Err.Error(), "An existing connection was forcibly closed by the remote host.")
+		// fmt.Println("isErrConnReset net.OpError.Err type:", reflect.TypeOf(ne))
+		errMsg := ne.Err.Error()
+		if errno, enok := ne.Err.(syscall.Errno); enok {
+			// I got these number by print. Only tested on XP.
+			// debug.Println("isErrConnReset errno:", errno)
+			return errno == 64 || errno == 10054
+		} else if strings.Contains(errMsg, "forcibly closed") || strings.Contains(errMsg, " timeout") {
+			// "forcibly closed"
+			// "use of closed network connection" occurs in firefox session reloading, legal close
+			return true
+		} else if ne.Err != nil {
+			// wsasend: An established connection was aborted by the software in your host machine.
+			// Not firewall interruption error, FIN following request
+			debug.Println("isErrConnReset Err:", ne.Err)
+		}
 	}
 	return false
 }
 
+// The error msg:
+// 1. dial tcp: lookup ***.***.com: getaddrinfow: The requested name is valid,
+//    but no data of the requested type was found.
+// 2. dial tcp: lookup abc.dddeeeff.com: no such host
 func isDNSError(err error) bool {
-	/*
-		fmt.Printf("calling isDNSError for err type: %v %s\n",
-			reflect.TypeOf(err), err.Error())
-	*/
-	// DNS error are not of type DNSError on Windows, so I used this ugly
-	// hack.
+	// DNS error are not of type DNSError on Windows
 	errMsg := err.Error()
-	return strings.Contains(errMsg, "No such host") ||
-		strings.Contains(errMsg, "GetAddrInfoW") ||
-		strings.Contains(errMsg, "dial tcp")
+	return strings.Contains(errMsg, " lookup ")
 }
 
 func isErrOpWrite(err error) bool {

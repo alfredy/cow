@@ -31,6 +31,8 @@ type Header struct {
 	ContLen             int64
 	KeepAlive           time.Duration
 	ProxyAuthorization  string
+	ProxySupport        string
+	WWWAuthenticate     bool
 	Chunking            bool
 	Trailer             bool
 	ConnectionKeepAlive bool
@@ -43,8 +45,8 @@ type rqState byte
 const (
 	rsCreated  rqState = iota
 	rsSent             // request has been sent to server
-	rsRecvBody         // response header received, receiving response body
-	rsDone
+	rsRecv             // receiving response from me
+	rsDone         	   // received
 )
 
 type Request struct {
@@ -119,11 +121,11 @@ func (r *Request) tooManyRetry() bool {
 }
 
 func (r *Request) responseNotSent() bool {
-	return r.state <= rsSent
+	return r.state < rsRecv
 }
 
-func (r *Request) hasSent() bool {
-	return r.state >= rsSent
+func (r *Request) responseHasSent() bool {
+	return r.state >= rsRecv
 }
 
 func (r *Request) releaseBuf() {
@@ -134,6 +136,9 @@ func (r *Request) releaseBuf() {
 	}
 }
 
+// Request raw:
+// 0[saveReqLine?MethodLine:]reqLnStart[("CONNECT"?(dbgRq && verbose && !saveReqLine)?MethodLine:):genRequestLine]headStart[parsedHeader]bodyStart
+
 // rawRequest returns the raw request that can be sent directly to HTTP/1.1 server.
 func (r *Request) rawRequest() []byte {
 	return r.raw.Bytes()[r.reqLnStart:]
@@ -143,8 +148,9 @@ func (r *Request) rawBeforeBody() []byte {
 	return r.raw.Bytes()[:r.bodyStart]
 }
 
-func (r *Request) rawHeaderBody() []byte {
-	return r.raw.Bytes()[r.headStart:]
+// Header without Body
+func (r *Request) rawHeader() []byte {
+	return r.raw.Bytes()[r.headStart:r.bodyStart]
 }
 
 func (r *Request) rawBody() []byte {
@@ -318,6 +324,9 @@ func ParseRequestURIBytes(rawurl []byte) (*URL, error) {
 // Note RFC2616 only says about "Connection", no "Proxy-Connection", but
 // Firefox and Safari send this header along with "Connection" header.
 // See more at http://homepage.ntlworld.com/jonathan.deboynepollard/FGA/web-proxy-connection-header.html
+//
+// "Proxy-Support: Session-Based-Authentication" needed for tunneling NTLM,
+// https://tools.ietf.org/html/rfc4559#section-6
 const (
     headerCacheControl       = "cache-control"
 	headerConnection         = "connection"
@@ -329,6 +338,8 @@ const (
 	headerProxyAuthenticate  = "proxy-authenticate"
 	headerProxyAuthorization = "proxy-authorization"
 	headerProxyConnection    = "proxy-connection"
+	headerProxySupport       = "proxy-support"
+	headerWWWAuthenticate    = "www-authenticate"
 	headerReferer            = "referer"
 	headerTE                 = "te"
 	headerTrailer            = "trailer"
@@ -338,6 +349,7 @@ const (
 	fullHeaderConnectionKeepAlive = "Connection: keep-alive\r\n"
 	fullHeaderConnectionClose     = "Connection: close\r\n"
 	fullHeaderTransferEncoding    = "Transfer-Encoding: chunked\r\n"
+	fullHeaderProxySupport        = "Proxy-Support: Session-Based-Authentication\r\n"
 )
 
 // Using Go's method expression
@@ -349,6 +361,8 @@ var headerParser = map[string]HeaderParserFunc{
 	headerKeepAlive:          (*Header).parseKeepAlive,
 	headerProxyAuthorization: (*Header).parseProxyAuthorization,
 	headerProxyConnection:    (*Header).parseConnection,
+	headerProxySupport:       (*Header).parseProxySupport,
+	headerWWWAuthenticate:    (*Header).parseWWWAuthenticate,
 	headerTransferEncoding:   (*Header).parseTransferEncoding,
 	headerTrailer:            (*Header).parseTrailer,
 }
@@ -364,6 +378,7 @@ var hopByHopHeader = map[string]bool{
 	headerKeepAlive:          true,
 	headerProxyAuthorization: true,
 	headerProxyConnection:    true,
+	headerProxySupport:       true,
 	headerTE:                 true,
 	headerTrailer:            true,
 	headerTransferEncoding:   true,
@@ -423,6 +438,19 @@ func (h *Header) parseKeepAlive(s []byte) (err error) {
 
 func (h *Header) parseProxyAuthorization(s []byte) error {
 	h.ProxyAuthorization = string(s)
+	return nil
+}
+
+func (h *Header) parseProxySupport(s []byte) error {
+	h.ProxySupport = string(s)
+	if h.ProxySupport == "" {
+		h.ProxySupport = "Session-Based-Authentication"
+	}
+	return nil
+}
+
+func (h *Header) parseWWWAuthenticate(s []byte) error {
+	h.WWWAuthenticate = len(s) > 0
 	return nil
 }
 
@@ -713,7 +741,7 @@ func (rp *Response) hasBody(method string) bool {
 func parseResponse(sv *serverConn, r *Request, rp *Response) (err error) {
 	var s []byte
 	reader := sv.bufRd
-	if sv.maybeFake() {
+	if sv.isAttackableState(r) {
 		sv.setReadTimeout("parseResponse")
 	}
 	if s, err = reader.ReadSlice('\n'); err != nil {
@@ -726,7 +754,7 @@ func parseResponse(sv *serverConn, r *Request, rp *Response) (err error) {
 		// is caused by GFW.
 		return err
 	}
-	if sv.maybeFake() {
+	if sv.isAttackableState(r) {
 		sv.unsetReadTimeout("parseResponse")
 	}
 	// debug.Printf("Response line %s", s)
@@ -748,17 +776,20 @@ func parseResponse(sv *serverConn, r *Request, rp *Response) (err error) {
 	}
 
 	proto := f[0]
-	if !bytes.Equal(proto[0:7], []byte("HTTP/1.")) {
+	// obselete HTTP/0.9: Response hypertext only
+	if !bytes.Equal(proto[0:5], []byte("HTTP/")) {
 		return fmt.Errorf("invalid response status line: %s request %v", string(f[0]), r)
 	}
-	if proto[7] == '1' {
-		rp.raw.Write(s)
-	} else if proto[7] == '0' {
+	if bytes.Equal(proto[5:8], []byte("1.0")) {
 		// Should return HTTP version as 1.1 to client since closed connection
 		// will be converted to chunked encoding
 		rp.genStatusLine()
 	} else {
-		return fmt.Errorf("response protocol not supported: %s", f[0])
+		// 1.1, 2.0 (spurious) ...
+		// https://http2.github.io/http2-spec/#discover-http
+		// https://http2.github.io/http2-spec/#ConnectionHeader
+		// https://developer.mozilla.org/en-US/docs/Web/HTTP/Basics_of_HTTP/Evolution_of_HTTP
+		rp.raw.Write(s)
 	}
 
 	if err = rp.parseHeader(reader, rp.raw, r.URL); err != nil {
@@ -801,6 +832,13 @@ func parseResponse(sv *serverConn, r *Request, rp *Response) (err error) {
 	} else {
 		rp.raw.WriteString(fullHeaderConnectionClose)
 	}
+	// "Proxy-Support: Session-Based-Authentication" needed for tunneling NTLM,
+	// https://tools.ietf.org/html/rfc4559#section-6
+	// ProxySupport only for client
+	if rp.Status == 401 && rp.WWWAuthenticate {
+		rp.raw.WriteString(fullHeaderProxySupport)
+	}
+	//
 	rp.raw.WriteString(CRLF)
 
 	return nil

@@ -43,9 +43,14 @@ const defaultServerConnTimeout = 15 * time.Second
 const clientConnTimeout = 15 * time.Second
 const fullKeepAliveHeader = "Keep-Alive: timeout=15\r\n"
 
-// If client closed connection for HTTP CONNECT method in less then 1 second,
+// Case 1: client sends close
+// If client closed connection for HTTP CONNECT method in less than 1 second,
 // consider it as an ssl error. This is only effective for Chrome which will
 // drop connection immediately upon SSL error.
+// Case 2: server sends close
+// Connected, but TLS handshake packages with server are dropped by the firewall,
+// then get server ACK and RST (fake) the connection!
+// Case *: DNS pollution, cert mismatch: client close or timeout?
 const sslLeastDuration = time.Second
 
 // Some code are learnt from the http package
@@ -76,7 +81,10 @@ func (dc directConn) String() string {
 type serverConnState byte
 
 const (
-	svConnected serverConnState = iota
+	svSYNed serverConnState = iota
+	svCONNECTed
+	svSendRecvClientHello // further than CONNECT
+	svSendRecvRequest
 	svSendRecvResponse
 	svStopped
 )
@@ -375,12 +383,14 @@ end:
 	return errPageSent
 }
 
+// DNS Lookup --> TCP SYN --> [CONNECT] --> (http-request|https-hello) --> (FIN|RST|timeout)
+// FIN won't cause error
 func (c *clientConn) shouldRetry(r *Request, sv *serverConn, re error) bool {
 	if !isErrRetry(re) {
 		return false
 	}
 	err, _ := re.(RetryError)
-	if !r.responseNotSent() {
+	if (!r.isConnect && r.responseHasSent()) || (r.isConnect && sv.state > svSendRecvClientHello) {
 		if debug {
 			debug.Printf("cli(%s) has sent some response, can't retry %v\n", c.RemoteAddr(), r)
 		}
@@ -400,7 +410,7 @@ func (c *clientConn) shouldRetry(r *Request, sv *serverConn, re error) bool {
 		panic(msg)
 	}
 	if r.tooManyRetry() {
-		if sv.maybeFake() {
+		if sv.isAttackableState(r) {
 			// Sometimes GFW reset will got EOF error leading to retry too many times.
 			// In that case, consider the url as temp blocked and try parent proxy.
 			siteStat.TempBlocked(r.URL)
@@ -459,6 +469,7 @@ func (c *clientConn) serve() {
 			panic("client read buffer nil")
 		}
 
+		// 1 package or multiple packages (my sendHTTPProxyRequestHeader, delayed)
 		if err = parseRequest(c, &r); err != nil {
 			debug.Printf("cli(%s) parse request %v\n", c.RemoteAddr(), err)
 			if err == io.EOF || isErrConnReset(err) {
@@ -512,6 +523,11 @@ func (c *clientConn) serve() {
 		}
 
 	retry:
+		// 1. CONNECT fails, just retry, client will handle it
+		// 2. TLS Hello fails:
+		//    2.1 return to client, re-connect with proxy, easy;
+		//    2.2 retry the 2 steps, depends on server connection, too complex;
+		// 3. TLS is packaged as TCP data, just rawRequest, but no http request
 		r.tryOnce()
 		if bool(debug) && r.isRetry() {
 			debug.Printf("cli(%s) retry request tryCnt=%d %v\n", c.RemoteAddr(), r.tryCnt, &r)
@@ -534,6 +550,7 @@ func (c *clientConn) serve() {
 			return
 		}
 
+		// HTTP CONNECT, HTTPS, https://en.wikipedia.org/wiki/HTTP_tunnel#HTTP_CONNECT_method
 		if r.isConnect {
 			// server connection will be closed in doConnect
 			err = sv.doConnect(&r, c)
@@ -544,13 +561,14 @@ func (c *clientConn) serve() {
 			return
 		}
 
+		// HTTP
 		if err = sv.doRequest(c, &r, &rp); err != nil {
 			// For client I/O error, we can actually put server connection to
 			// pool. But let's make thing simple for now.
 			sv.Close()
 			if c.shouldRetry(&r, sv, err) {
 				goto retry
-			} else if err == errPageSent && (!r.hasBody() || r.hasSent()) {
+			} else if err == errPageSent && (!r.hasBody() || r.responseHasSent()) {
 				// Can only continue if request has no body, or request body
 				// has been read.
 				continue
@@ -566,6 +584,11 @@ func (c *clientConn) serve() {
 			// If the server connection is not going to be used soon,
 			// release buffer before putting back to pool can save memory.
 			sv.releaseBuf()
+			// Would there be zombies that occupied the seats?
+			// closeStaleServerConn is scheduled to clean in loop when the channel is created.
+			// sv.willCloseOn is set when get response and say rp.ConnectionKeepAlive,
+			// and getConnFromChan closes the overtimed ones match the selection only.
+			// sv that lost control and won't be used again would be zombies!
 			connPool.Put(sv)
 		} else {
 			if debug {
@@ -604,7 +627,7 @@ func (c *clientConn) handleServerReadError(r *Request, sv *serverConn, err error
 	if err == io.EOF {
 		return RetryError{err}
 	}
-	if sv.maybeFake() && maybeBlocked(err) {
+	if sv.isAttackableState(r) && maybeBlocked(err) {
 		return c.handleBlockedRequest(r, err)
 	}
 	if r.responseNotSent() {
@@ -618,7 +641,7 @@ func (c *clientConn) handleServerReadError(r *Request, sv *serverConn, err error
 func (c *clientConn) handleServerWriteError(r *Request, sv *serverConn, err error, msg string) error {
 	// This function is only called in doRequest, no response is sent to client.
 	// So if visiting blocked site, can always retry request.
-	if sv.maybeFake() && isErrConnReset(err) {
+	if sv.isAttackableState(r) && isErrConnReset(err) {
 		siteStat.TempBlocked(r.URL)
 	}
 	return RetryError{err}
@@ -667,7 +690,7 @@ func (c *clientConn) readResponse(sv *serverConn, r *Request, rp *Response) (err
 	// ther server as real instead of fake one caused by wrong DNS reply. So
 	// don't time out later.
 	sv.state = svSendRecvResponse
-	r.state = rsRecvBody
+	r.state = rsRecv
 	r.releaseBuf()
 
 	if _, err = c.Write(rp.rawResponse()); err != nil {
@@ -726,7 +749,7 @@ func (c *clientConn) getServerConn(r *Request) (*serverConn, error) {
 		// For websites like feedly, the site itself is not blocked, but the
 		// content it loads may result reset. So we should reset server
 		// connection state to just connected.
-		sv.state = svConnected
+		sv.state = svCONNECTed
 		if debug {
 			debug.Printf("cli(%s) connPool get %s\n", c.RemoteAddr(), r.URL.HostPort)
 		}
@@ -794,12 +817,18 @@ func maybeBlocked(err error) bool {
 	return isErrTimeout(err) || isErrConnReset(err) || isHttpErrCode(err)
 }
 
+// https://tools.ietf.org/html/rfc7231#section-6.5.1
+var connBadRequest = []byte("HTTP/1.1 400 Bad Request\r\n\r\n")
+
 // Connect to requested server according to whether it's visit count.
 // If direct connection fails, try parent proxies.
 func (c *clientConn) connect(r *Request, siteInfo *VisitCnt) (srvconn net.Conn, err error) {
 	var errMsg string
 	if config.AlwaysProxy {
 		if srvconn, err = parentProxy.connect(r.URL); err == nil {
+			if dbgRq {
+				dbgRq.Printf("cli(%s) CONNECT  proxy(%s) <- %s\n", c.RemoteAddr(), srvconn.RemoteAddr(), r)
+			}
 			return
 		}
 		errMsg = genErrMsg(r, nil, "Parent proxy connection failed, always use parent proxy.")
@@ -808,6 +837,9 @@ func (c *clientConn) connect(r *Request, siteInfo *VisitCnt) (srvconn net.Conn, 
 	if siteInfo.AsBlocked() && !parentProxy.empty() {
 		// In case of connection error to socks server, fallback to direct connection
 		if srvconn, err = parentProxy.connect(r.URL); err == nil {
+			if dbgRq {
+				dbgRq.Printf("cli(%s) CONNECT  proxy(%s) <- %s\n", c.RemoteAddr(), srvconn.RemoteAddr(), r)
+			}
 			return
 		}
 		if siteInfo.AlwaysBlocked() {
@@ -835,6 +867,17 @@ func (c *clientConn) connect(r *Request, siteInfo *VisitCnt) (srvconn net.Conn, 
 			errMsg = genErrMsg(r, nil, "Direct connection failed, always direct site.")
 			goto fail
 		}
+
+		// User's DNS/host filtering: parse host to 0.0.0.0 or 127.0.0.1
+		// For go, blocked domain causes error, it won't return 0.0.0.0, but "0.0.0.0" returns 0.0.0.0
+		// We trust DNS lookup, and leave the work to reliable DNS servers (:
+		if isDNSError(err) {
+			debug.Println("DNS lookup failed:", r.URL.Host)
+			c.Write(connBadRequest)
+			// the desired err
+			return
+		}
+
 		// net.Dial does two things: DNS lookup and TCP connection.
 		// GFW may cause failure here: make it time out or reset connection.
 		// debug.Printf("type of err %T %v\n", err, err)
@@ -847,9 +890,9 @@ func (c *clientConn) connect(r *Request, siteInfo *VisitCnt) (srvconn net.Conn, 
 		var socksErr error
 		if srvconn, socksErr = parentProxy.connect(r.URL); socksErr == nil {
 			c.handleBlockedRequest(r, err)
-			if debug {
-				debug.Printf("cli(%s) direct connection failed, use parent proxy for %v\n",
-					c.RemoteAddr(), r)
+			if dbgRq {
+				dbgRq.Printf("cli(%s) direct connection failed, use parent proxy(%s) to %v\n",
+					c.RemoteAddr(), srvconn.RemoteAddr(), r)
 			}
 			return srvconn, nil
 		}
@@ -868,6 +911,7 @@ func (c *clientConn) createServerConn(r *Request, siteInfo *VisitCnt) (*serverCo
 		return nil, err
 	}
 	sv := newServerConn(srvconn, r.URL.HostPort, siteInfo)
+	sv.state = svSYNed
 	if debug {
 		debug.Printf("cli(%s) connected to %s %d concurrent connections\n",
 			c.RemoteAddr(), sv.hostPort, incSrvConnCnt(sv.hostPort))
@@ -929,8 +973,16 @@ func (sv *serverConn) Close() error {
 	return sv.Conn.Close()
 }
 
-func (sv *serverConn) maybeFake() bool {
-	return sv.state == svConnected && sv.isDirect() && !sv.siteInfo.AlwaysDirect()
+func (sv *serverConn) willTryProxy() bool {
+	return sv.isDirect() && !sv.siteInfo.AlwaysDirect()
+}
+
+// TCP connection established, could be TLS handshake or http request
+func (sv *serverConn) isAttackableState(r *Request) bool {
+	return svCONNECTed < sv.state &&
+			((r.isConnect && sv.state <= svSendRecvClientHello) ||
+				(!r.isConnect && sv.state <= svSendRecvRequest)) &&
+			sv.willTryProxy()
 }
 
 func setConnReadTimeout(cn net.Conn, d time.Duration, msg string) {
@@ -960,11 +1012,18 @@ func (sv *serverConn) unsetReadTimeout(msg string) {
 	unsetConnReadTimeout(sv.Conn, msg)
 }
 
-func (sv *serverConn) maybeSSLErr(cliStart time.Time) bool {
+func isNextPackageQuick(cliStart time.Time) bool {
+	// Case 1: client sends close
 	// If client closes connection very soon, maybe there's SSL error, maybe
 	// not (e.g. user stopped request).
 	// COW can't tell which is the case, so this detection is not reliable.
-	return sv.state > svConnected && time.Now().Sub(cliStart) < sslLeastDuration
+	// * https cert error, close
+	// * Firefox session reload, send FIN to the connection immediately.
+	// * wget sends RST, curl sends FIN when finish
+	// Case 2: server sends close
+	// Connected, but TLS handshake packages with server are dropped by the firewall,
+	// then get server ACK and RST (fake) the connection!
+	return time.Now().Sub(cliStart) < sslLeastDuration
 }
 
 func (sv *serverConn) mayBeClosed() bool {
@@ -984,6 +1043,7 @@ const connectBufSize = 4096
 var connectBuf = leakybuf.NewLeakyBuf(512, connectBufSize)
 
 func copyServer2Client(sv *serverConn, c *clientConn, r *Request) (err error) {
+	debug.Printf("copyServer2Client: srv(%s)->cli(%s)\n", r.URL.HostPort, c.RemoteAddr())
 	buf := connectBuf.Get()
 	defer func() {
 		connectBuf.Put(buf)
@@ -991,7 +1051,7 @@ func copyServer2Client(sv *serverConn, c *clientConn, r *Request) (err error) {
 
 	/*
 		// force retry for debugging
-		if r.tryCnt == 1 && sv.maybeFake() {
+		if r.tryCnt == 1 && sv.isAttackableState(r) {
 			time.Sleep(1)
 			return RetryError{errors.New("debug retry in copyServer2Client")}
 		}
@@ -1002,7 +1062,7 @@ func copyServer2Client(sv *serverConn, c *clientConn, r *Request) (err error) {
 	readTimeoutSet := false
 	for {
 		// debug.Println("srv->cli")
-		if sv.maybeFake() {
+		if sv.isAttackableState(r) {
 			sv.setReadTimeout("srv->cli")
 			readTimeoutSet = true
 		} else if readTimeoutSet {
@@ -1011,25 +1071,38 @@ func copyServer2Client(sv *serverConn, c *clientConn, r *Request) (err error) {
 		}
 		var n int
 		if n, err = sv.Read(buf); err != nil {
-			if sv.maybeFake() && maybeBlocked(err) {
+			// also in case of only 1 server TCP RST which is abnormal
+			if sv.isAttackableState(r) && maybeBlocked(err) {
+				// not initiated by client
 				siteStat.TempBlocked(r.URL)
-				debug.Printf("srv->cli blocked site %s detected, err: %v retry\n", r.URL.HostPort, err)
+				info.Printf("srv->cli blocked site %s detected, err: %v retry\n", r.URL.HostPort, err)
 				return RetryError{err}
 			}
-			// Expected error besides EOF: "use of closed network connection",
+			// Expected error besides EOF
 			// this is to make blocking read return.
 			// debug.Printf("copyServer2Client read data: %v\n", err)
 			return
 		}
+		// when retry CONNECT before TLS HELLO, just skip forward the response to client, and then deliver TLS HELLO
+		if r.isRetry() && sv.state < svCONNECTed {
+			debug.Printf("Skip remote response for CONNECT: srv(%s)->cli(%s)\n", r.URL.HostPort, c.RemoteAddr())
+			sv.state = svCONNECTed
+			continue
+		}
+
 		total += n
 		if _, err = c.Write(buf[0:n]); err != nil {
 			// debug.Printf("copyServer2Client write data: %v\n", err)
 			return
 		}
-		// debug.Printf("srv(%s)->cli(%s) sent %d bytes data\n", r.URL.HostPort, c.RemoteAddr(), total)
-		// set state to rsRecvBody to indicate the request has partial response sent to client
-		r.state = rsRecvBody
-		sv.state = svSendRecvResponse
+		// debug.Printf("srv(%s)->cli(%s) sent %d bytes data\n", r.URL.HostPort, c.RemoteAddr(), n)
+		// set state to rsRecv to indicate the request has partial response sent to client
+		r.state = rsRecv
+		if r.isConnect && sv.state < svSendRecvClientHello {
+			sv.state = svSendRecvClientHello
+		} else {
+			sv.state = svSendRecvResponse
+		}
 		if total > directThreshold {
 			sv.updateVisit()
 		}
@@ -1067,7 +1140,8 @@ func (sw *serverWriter) Write(p []byte) (int, error) {
 }
 
 func copyClient2Server(c *clientConn, sv *serverConn, r *Request, srvStopped notification, done chan struct{}) (err error) {
-	// sv.maybeFake may change during execution in this function.
+	debug.Printf("copyClient2Server: cli(%s)->srv(%s)\n", c.RemoteAddr(), r.URL.HostPort)
+	// sv.isAttackableState may change during execution in this function.
 	// So need a variable to record the whether timeout is set.
 	deadlineIsSet := false
 	defer func() {
@@ -1080,8 +1154,17 @@ func copyClient2Server(c *clientConn, sv *serverConn, r *Request, srvStopped not
 	}()
 
 	var n int
+	var start time.Time
 
-	if r.isRetry() {
+	// Just forward the rawBody/incoming data
+	// if isTLSHello, should wait until server is ready
+	if r.isRetry() && len(r.rawBody()) > 0 {
+		// debug.Printf("has data after connecting: %s\n", r.URL.HostPort)
+		// block until CONNECT returns OK or fails again
+		for r.isConnect && sv.state < svCONNECTed && sv.bufRd != nil {
+			debug.Printf("waiting parent proxy get ready\n")
+			time.Sleep(1)
+		}
 		if debug {
 			debug.Printf("cli(%s)->srv(%s) retry request %d bytes of buffered body\n",
 				c.RemoteAddr(), r.URL.HostPort, len(r.rawBody()))
@@ -1103,13 +1186,12 @@ func copyClient2Server(c *clientConn, sv *serverConn, r *Request, srvStopped not
 			}
 		}
 		if debug {
-			debug.Printf("cli(%s)->srv(%s) released read buffer\n",
-				c.RemoteAddr(), r.URL.HostPort)
+			debug.Printf("cli(%s)->srv(%s) released read buffer[%d] \n",
+				c.RemoteAddr(), r.URL.HostPort, n)
 		}
 		c.releaseBuf()
 	}
 
-	var start time.Time
 	if config.DetectSSLErr {
 		start = time.Now()
 	}
@@ -1119,18 +1201,22 @@ func copyClient2Server(c *clientConn, sv *serverConn, r *Request, srvStopped not
 	}()
 	for {
 		// debug.Println("cli->srv")
-		if sv.maybeFake() {
+		if sv.isAttackableState(r) {
 			setConnReadTimeout(c.Conn, time.Second, "cli->srv")
 			deadlineIsSet = true
 		} else if deadlineIsSet {
-			// maybeFake may trun to false after timeout, but timeout should be unset
+			// isAttackableState may trun to false after timeout, but timeout should be unset
 			unsetConnReadTimeout(c.Conn, "cli->srv before read")
 			deadlineIsSet = false
 		}
 		if n, err = c.Read(buf); err != nil {
-			if config.DetectSSLErr && sv.maybeFake() && (isErrConnReset(err) || err == io.EOF) &&
-				sv.maybeSSLErr(start) {
-				debug.Println("client connection closed very soon, taken as SSL error:", r)
+			if config.DetectSSLErr && sv.isAttackableState(r) && isErrConnReset(err) &&
+				isNextPackageQuick(start){
+				// 0. server error is caught in copyServer2Client routin
+				// 1. https cert err, client close, retry; Hello sent
+				// 2. Firefox session reload, send FIN to the connection immediately, pass; no data sent
+				// chrome: just stop to send new TCP packet, neither FIN nor RST; we catch the fake server RST
+				info.Println("client connection closed very soon, taken as SSL error:", err)
 				siteStat.TempBlocked(r.URL)
 			} else if isErrTimeout(err) && !srvStopped.hasNotified() {
 				// debug.Printf("cli(%s)->srv(%s) timeout\n", c.RemoteAddr(), r.URL.HostPort)
@@ -1144,7 +1230,7 @@ func copyClient2Server(c *clientConn, sv *serverConn, r *Request, srvStopped not
 		if _, err = w.Write(buf[:n]); err != nil {
 			// XXX is it enough to only do block detection in copyServer2Client?
 			/*
-				if sv.maybeFake() && isErrConnReset(err) {
+				if sv.isAttackableState(r) && isErrConnReset(err) {
 					siteStat.TempBlocked(r.URL)
 					errl.Printf("copyClient2Server blocked site %d detected, retry\n", r.URL.HostPort)
 					return RetryError{err}
@@ -1154,13 +1240,22 @@ func copyClient2Server(c *clientConn, sv *serverConn, r *Request, srvStopped not
 			return
 		}
 		// debug.Printf("cli(%s)->srv(%s) sent %d bytes data\n", c.RemoteAddr(), r.URL.HostPort, n)
+		// if here are separated CONNECT packages, it is still CONNECT, and data from the beginning.
+		// Implies: r.hasBody() and has been forwarded
+		if sv.state < svSendRecvClientHello {
+			sv.state = svSendRecvClientHello
+		} else {
+			sv.state = svSendRecvRequest
+		}
 	}
 }
 
 var connEstablished = []byte("HTTP/1.1 200 Tunnel established\r\n\r\n")
 
-// Do HTTP CONNECT
+// TCP connected
+// Do HTTP CONNECT, and HTTPS requests packaged as data
 func (sv *serverConn) doConnect(r *Request, c *clientConn) (err error) {
+	debug.Printf("doConnect: cli(%s)->srv(%s)\n", c.RemoteAddr(), r.URL.HostPort)
 	r.state = rsCreated
 
 	_, isHttpConn := sv.Conn.(httpConn)
@@ -1183,6 +1278,7 @@ func (sv *serverConn) doConnect(r *Request, c *clientConn) (err error) {
 		}
 	}
 
+	// New concurrent thread for Client data incoming
 	var cli2srvErr error
 	done := make(chan struct{})
 	srvStopped := newNotification()
@@ -1210,7 +1306,12 @@ func (sv *serverConn) doConnect(r *Request, c *clientConn) (err error) {
 	return
 }
 
+// In separated packages? Yes, but ...
+// How to be parsed when face this as cow server?
+// Conn.Buf is maintained as a file by the driver!
+// once for 1 connection
 func (sv *serverConn) sendHTTPProxyRequestHeader(r *Request, c *clientConn) (err error) {
+	// debug.Println("r.proxyRequestLine()", r.proxyRequestLine())
 	if _, err = sv.Write(r.proxyRequestLine()); err != nil {
 		return c.handleServerWriteError(r, sv, err,
 			"send proxy request line to http parent")
@@ -1222,14 +1323,17 @@ func (sv *serverConn) sendHTTPProxyRequestHeader(r *Request, c *clientConn) (err
 				"send proxy authorization header to http parent")
 		}
 	}
+	// Still not "\r\n\r\n" end!
+
 	// When retry, body is in raw buffer.
-	if _, err = sv.Write(r.rawHeaderBody()); err != nil {
+	// debug.Println("r.rawHeader()", r.rawHeader())
+	if _, err = sv.Write(r.rawHeader()); err != nil {
 		return c.handleServerWriteError(r, sv, err,
 			"send proxy request header to http parent")
 	}
 	/*
 		if bool(dbgRq) && verbose {
-			debug.Printf("request to http proxy:\n%s%s", r.proxyRequestLine(), r.rawHeaderBody())
+			debug.Printf("request to http proxy:\n%s%s", r.proxyRequestLine(), r.rawHeader())
 		}
 	*/
 	return
@@ -1273,8 +1377,9 @@ func (sv *serverConn) sendRequestBody(r *Request, c *clientConn) (err error) {
 	return
 }
 
-// Do HTTP request other that CONNECT
+// Do HTTP request rather than CONNECT
 func (sv *serverConn) doRequest(c *clientConn, r *Request, rp *Response) (err error) {
+	debug.Printf("doRequest: cli(%s)->srv(%s)\n", c.RemoteAddr(), r.URL.HostPort)
 	r.state = rsCreated
 	if err = sv.sendRequestHeader(r, c); err != nil {
 		return
@@ -1283,6 +1388,7 @@ func (sv *serverConn) doRequest(c *clientConn, r *Request, rp *Response) (err er
 		return
 	}
 	r.state = rsSent
+	sv.state = svSendRecvRequest
 	if err = c.readResponse(sv, r, rp); err == nil {
 		sv.updateVisit()
 	}
@@ -1427,6 +1533,10 @@ func sendBodySplitIntoChunk(w io.Writer, r *bufio.Reader) (err error) {
 
 // Send message body.
 func sendBody(w io.Writer, bufRd *bufio.Reader, contLen int, chunk bool) (err error) {
+	// wsasend: An established connection was aborted by the software in your host machine.
+	// Sometimes client send TCP FIN immediately after a request. w becomes unavailable ):
+	// Not big deal, just write and feedback.
+	//
 	// chunked encoding has precedence over content length
 	// COW does not sanitize response header, but can correctly handle it
 	if chunk {
